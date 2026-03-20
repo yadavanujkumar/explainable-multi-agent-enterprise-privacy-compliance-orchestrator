@@ -1,69 +1,306 @@
-import express from 'express';
-import { Kafka } from 'kafkajs';
+/**
+ * Enterprise API Gateway – Privacy Compliance Orchestrator
+ *
+ * Features:
+ *  - Slack Block Kit + Microsoft Teams Adaptive Card integrations
+ *  - HMAC-SHA256 Slack signature verification
+ *  - Express rate-limiting (per-IP)
+ *  - Structured Winston logging + audit trail middleware
+ *  - /health and /readyz probes for Kubernetes
+ *  - Zod request validation
+ *  - Graceful shutdown (SIGTERM / SIGINT)
+ *  - Kafka consumer / producer with retry and acks=all
+ */
+import crypto from 'crypto';
+import express, { NextFunction, Request, Response } from 'express';
+import rateLimit from 'express-rate-limit';
+import { Kafka, logLevel as kafkaLogLevel } from 'kafkajs';
+import { z } from 'zod';
+
 import { SlackIntegration } from './application/SlackIntegration';
+import { TeamsIntegration } from './application/TeamsIntegration';
+import { logger } from './infrastructure/logger';
+import { auditLogger } from './middleware/auditLogger';
+import { verifySlackSignature } from './middleware/slackVerification';
 
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+const PORT = Number(process.env.PORT ?? 3000);
+const BROKER = process.env.KAFKA_BROKER ?? 'localhost:9092';
+const REMEDIATION_TOPIC = process.env.REMEDIATION_TOPIC ?? 'remediation_actions';
+const ALERT_TOPIC = process.env.ALERT_TOPIC ?? 'compliance_alerts';
+
+// ---------------------------------------------------------------------------
+// Zod schemas for inbound request validation
+// ---------------------------------------------------------------------------
+const SlackInteractionSchema = z.object({
+  type: z.string(),
+  actions: z
+    .array(
+      z.object({
+        action_id: z.string().optional(),
+        value: z.string(),
+        block_id: z.string().optional(),
+      })
+    )
+    .min(1),
+  user: z.object({ id: z.string(), name: z.string() }).optional(),
+  // Block Kit uses block_id; legacy Interactive Messages use callback_id
+  callback_id: z.string().optional(),
+});
+
+const TeamsActionSchema = z.object({
+  alertId: z.string(),
+  action: z.enum(['approve_remediation', 'reject']),
+});
+
+// ---------------------------------------------------------------------------
+// Express application
+// ---------------------------------------------------------------------------
 const app = express();
+
+// Capture raw body for Slack HMAC verification before JSON parsing
+app.use(
+  (req: Request & { rawBody?: Buffer }, _res: Response, next: NextFunction) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      req.rawBody = Buffer.concat(chunks);
+      next();
+    });
+    req.on('error', next);
+  }
+);
+
 app.use(express.json());
+app.use(auditLogger);
 
-const port = process.env.PORT || 3000;
-const broker = process.env.KAFKA_BROKER || 'localhost:9092';
+// Global rate limiter: 120 req / min per IP
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+app.use(globalLimiter);
 
+// Strict rate limiter for webhook endpoints: 30 req / min
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Webhook rate limit exceeded.' },
+});
+
+// ---------------------------------------------------------------------------
+// Health / readiness probes
+// ---------------------------------------------------------------------------
+let kafkaReady = false;
+
+app.get('/health', (_req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    kafka_ready: kafkaReady,
+    uptime_seconds: Math.floor(process.uptime()),
+  });
+});
+
+app.get('/readyz', (_req, res) => {
+  if (!kafkaReady) {
+    return res.status(503).json({ status: 'not_ready', reason: 'kafka_not_connected' });
+  }
+  res.status(200).json({ status: 'ready' });
+});
+
+// ---------------------------------------------------------------------------
+// Kafka
+// ---------------------------------------------------------------------------
 const kafka = new Kafka({
   clientId: 'gateway-service',
-  brokers: [broker]
+  brokers: [BROKER],
+  logLevel: kafkaLogLevel.WARN,
+  retry: { retries: 10, initialRetryTime: 1000 },
 });
 
 const consumer = kafka.consumer({ groupId: 'gateway-group' });
-const producer = kafka.producer();
-const slackIntegration = new SlackIntegration();
+const producer = kafka.producer({ allowAutoTopicCreation: true });
 
-app.post('/webhook/slack', async (req, res) => {
-  try {
-    const payload = req.body;
-    // Simple verification for Slack Interactive Components
-    if (payload.type === 'interactive_message') {
-        const action = payload.actions[0].value;
-        const alertId = payload.callback_id;
-        
-        if (action === 'approve_remediation') {
-            await producer.send({
-                topic: 'remediation_actions',
-                messages: [
-                    { value: JSON.stringify({ alertId, status: 'APPROVED', timestamp: new Date().toISOString() }) }
-                ]
-            });
-            console.log(`[Zero-Trust Audit Log] Remediation approved for alert ${alertId} by user ${payload.user.name}`);
-            return res.status(200).send('Remediation Approved and Applied.');
-        }
+// ---------------------------------------------------------------------------
+// Integrations
+// ---------------------------------------------------------------------------
+const slackIntegration = new SlackIntegration();
+const teamsIntegration = new TeamsIntegration();
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /webhook/slack
+ *
+ * Receives Slack Block Kit interaction payloads (approve / reject).
+ * Verifies the Slack signing secret and publishes a remediation action to Kafka.
+ */
+app.post(
+  '/webhook/slack',
+  webhookLimiter,
+  verifySlackSignature,
+  async (req: Request, res: Response) => {
+    try {
+      const parsed = SlackInteractionSchema.safeParse(req.body);
+      if (!parsed.success) {
+        logger.warn('Invalid Slack payload', { errors: parsed.error.format() });
+        return res.status(400).json({ error: 'Invalid payload', details: parsed.error.format() });
+      }
+
+      const payload = parsed.data;
+      const action = payload.actions[0];
+      const alertId = action.block_id ?? payload.callback_id ?? 'unknown';
+      const actor = payload.user?.name ?? 'unknown';
+
+      if (action.value === 'approve_remediation') {
+        await producer.send({
+          topic: REMEDIATION_TOPIC,
+          messages: [
+            {
+              value: JSON.stringify({
+                alertId,
+                status: 'APPROVED',
+                actor,
+                timestamp: new Date().toISOString(),
+              }),
+            },
+          ],
+        });
+        logger.info('Remediation approved via Slack', { alertId, actor });
+        return res.status(200).json({ message: 'Remediation approved and queued.' });
+      }
+
+      if (action.value === 'reject') {
+        await producer.send({
+          topic: REMEDIATION_TOPIC,
+          messages: [
+            {
+              value: JSON.stringify({
+                alertId,
+                status: 'REJECTED',
+                actor,
+                timestamp: new Date().toISOString(),
+              }),
+            },
+          ],
+        });
+        logger.info('Remediation rejected via Slack', { alertId, actor });
+        return res.status(200).json({ message: 'Remediation rejected.' });
+      }
+
+      res.status(200).json({ message: 'Action acknowledged.' });
+    } catch (error) {
+      logger.error('Slack webhook processing error', { error });
+      res.status(500).json({ error: 'Internal server error' });
     }
-    res.status(200).send('OK');
+  }
+);
+
+/**
+ * POST /webhook/teams
+ *
+ * Receives Microsoft Teams Adaptive Card submit actions (approve / reject).
+ */
+app.post('/webhook/teams', webhookLimiter, async (req: Request, res: Response) => {
+  try {
+    const parsed = TeamsActionSchema.safeParse(req.body);
+    if (!parsed.success) {
+      logger.warn('Invalid Teams payload', { errors: parsed.error.format() });
+      return res.status(400).json({ error: 'Invalid payload', details: parsed.error.format() });
+    }
+
+    const { alertId, action } = parsed.data;
+    const status = action === 'approve_remediation' ? 'APPROVED' : 'REJECTED';
+
+    await producer.send({
+      topic: REMEDIATION_TOPIC,
+      messages: [
+        {
+          value: JSON.stringify({
+            alertId,
+            status,
+            actor: 'teams-user',
+            timestamp: new Date().toISOString(),
+          }),
+        },
+      ],
+    });
+
+    logger.info(`Remediation ${status} via Teams`, { alertId });
+    res.status(200).json({ message: `Remediation ${status.toLowerCase()}.` });
   } catch (error) {
-    console.error('Webhook processing error:', error);
-    res.status(500).send('Internal Server Error');
+    logger.error('Teams webhook processing error', { error });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-async function start() {
+// ---------------------------------------------------------------------------
+// Kafka consumer + server startup
+// ---------------------------------------------------------------------------
+async function start(): Promise<void> {
   await producer.connect();
   await consumer.connect();
-  await consumer.subscribe({ topic: 'compliance_alerts', fromBeginning: false });
+  await consumer.subscribe({ topic: ALERT_TOPIC, fromBeginning: false });
 
-  console.log('Gateway connected to Kafka.');
+  kafkaReady = true;
+  logger.info('Gateway connected to Kafka', { broker: BROKER });
 
   await consumer.run({
-    eachMessage: async ({ topic, partition, message }) => {
+    eachMessage: async ({ message }) => {
       if (!message.value) return;
-      const alert = JSON.parse(message.value.toString());
-      console.log(`Received compliance alert: ${alert.alert_id}`);
-      
-      // Trigger external integration
-      await slackIntegration.sendApprovalRequest(alert);
+      try {
+        const alert = JSON.parse(message.value.toString());
+        logger.info('Received compliance alert', { alert_id: alert.alert_id });
+
+        // Fan-out to both Slack and Teams
+        await Promise.allSettled([
+          slackIntegration.sendApprovalRequest(alert),
+          teamsIntegration.sendApprovalRequest(alert),
+        ]);
+      } catch (err) {
+        logger.error('Failed to process compliance alert', { error: err });
+      }
     },
   });
 
-  app.listen(port, () => {
-    console.log(`Gateway listening on port ${port}`);
+  const server = app.listen(PORT, () => {
+    logger.info('Gateway listening', { port: PORT });
   });
+
+  // ---------------------------------------------------------------------------
+  // Graceful shutdown
+  // ---------------------------------------------------------------------------
+  const shutdown = async (signal: string) => {
+    logger.info(`Received ${signal} – shutting down gracefully…`);
+    kafkaReady = false;
+
+    server.close(async () => {
+      try {
+        await consumer.disconnect();
+        await producer.disconnect();
+        logger.info('Gateway shut down cleanly.');
+        process.exit(0);
+      } catch (err) {
+        logger.error('Error during shutdown', { error: err });
+        process.exit(1);
+      }
+    });
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
-start().catch(console.error);
+start().catch((err) => {
+  logger.error('Fatal startup error', { error: err });
+  process.exit(1);
+});
