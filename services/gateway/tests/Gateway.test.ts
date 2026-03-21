@@ -259,3 +259,64 @@ describe('verifySlackSignature middleware', () => {
     expect(next).toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// CircuitBreaker tests
+// ---------------------------------------------------------------------------
+import { CircuitBreaker, CircuitOpenError } from '../src/infrastructure/circuitBreaker';
+
+describe('CircuitBreaker', () => {
+  it('should start in CLOSED state', () => {
+    const cb = new CircuitBreaker();
+    expect(cb.currentState).toBe('CLOSED');
+  });
+
+  it('should execute successfully in CLOSED state', async () => {
+    const cb = new CircuitBreaker();
+    const result = await cb.execute(() => Promise.resolve('ok'));
+    expect(result).toBe('ok');
+    expect(cb.currentState).toBe('CLOSED');
+  });
+
+  it('should remain CLOSED below the failure threshold', async () => {
+    const cb = new CircuitBreaker({ failureThreshold: 3 });
+    for (let i = 0; i < 2; i++) {
+      await expect(cb.execute(() => Promise.reject(new Error('fail')))).rejects.toThrow('fail');
+    }
+    expect(cb.currentState).toBe('CLOSED');
+  });
+
+  it('should trip to OPEN when failure threshold is reached', async () => {
+    const cb = new CircuitBreaker({ failureThreshold: 3 });
+    for (let i = 0; i < 3; i++) {
+      await expect(cb.execute(() => Promise.reject(new Error('fail')))).rejects.toThrow('fail');
+    }
+    expect(cb.currentState).toBe('OPEN');
+  });
+
+  it('should fast-fail with CircuitOpenError when OPEN', async () => {
+    const cb = new CircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 60_000 });
+    await expect(cb.execute(() => Promise.reject(new Error('fail')))).rejects.toThrow('fail');
+    expect(cb.currentState).toBe('OPEN');
+
+    await expect(cb.execute(() => Promise.resolve('should not run'))).rejects.toBeInstanceOf(CircuitOpenError);
+  });
+
+  it('should reset to CLOSED after a successful probe in HALF_OPEN', async () => {
+    const cb = new CircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 0 });
+    await expect(cb.execute(() => Promise.reject(new Error('fail')))).rejects.toThrow();
+    expect(cb.currentState).toBe('OPEN');
+
+    // resetTimeoutMs=0 means the window has already elapsed
+    await cb.execute(() => Promise.resolve('probe ok'));
+    expect(cb.currentState).toBe('CLOSED');
+  });
+
+  it('should return to OPEN if probe fails in HALF_OPEN', async () => {
+    const cb = new CircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 0 });
+    await expect(cb.execute(() => Promise.reject(new Error('fail')))).rejects.toThrow();
+
+    await expect(cb.execute(() => Promise.reject(new Error('probe fail')))).rejects.toThrow();
+    expect(cb.currentState).toBe('OPEN');
+  });
+});

@@ -236,3 +236,93 @@ class TestComplianceEngine:
         rules, _, _ = compliance_engine.evaluate(findings)
         rule_ids = [r.rule_id for r in rules]
         assert "HIPAA-001" in rule_ids
+
+
+# ---------------------------------------------------------------------------
+# Health / Metrics HTTP endpoint
+# ---------------------------------------------------------------------------
+import sys
+import threading
+import types
+from http.server import HTTPServer
+from unittest.mock import MagicMock
+
+
+def _import_health_handler():
+    """Import HealthHandler from src.main with Kafka mocked out."""
+    kafka_mock = types.ModuleType("kafka")
+    kafka_mock.KafkaConsumer = MagicMock()
+    kafka_mock.KafkaProducer = MagicMock()
+    errors_mock = types.ModuleType("kafka.errors")
+    errors_mock.KafkaError = Exception
+    errors_mock.NoBrokersAvailable = Exception
+    kafka_mock.errors = errors_mock
+
+    sys.modules.setdefault("kafka", kafka_mock)
+    sys.modules.setdefault("kafka.errors", errors_mock)
+
+    if "src.main" in sys.modules:
+        mod = sys.modules["src.main"]
+    else:
+        import importlib
+        mod = importlib.import_module("src.main")
+    return mod.HealthHandler, mod._health_state
+
+
+class TestHealthEndpoint:
+    """Spin up the in-process HTTP server and exercise all paths."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self):
+        HealthHandler, self.health_state = _import_health_handler()
+        server = HTTPServer(("127.0.0.1", 0), HealthHandler)
+        self.port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        yield
+        server.shutdown()
+
+    def _get(self, path: str):
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as r:
+            return r.status, r.read().decode()
+
+    def _get_status(self, path: str) -> int:
+        import urllib.error
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def test_healthz_returns_200_when_running(self) -> None:
+        original = self.health_state["status"]
+        self.health_state["status"] = "running"
+        try:
+            status, _ = self._get("/healthz")
+            assert status == 200
+        finally:
+            self.health_state["status"] = original
+
+    def test_healthz_returns_503_when_not_running(self) -> None:
+        original = self.health_state["status"]
+        self.health_state["status"] = "starting"
+        try:
+            code = self._get_status("/healthz")
+            assert code == 503
+        finally:
+            self.health_state["status"] = original
+
+    def test_metrics_endpoint_returns_prometheus_text(self) -> None:
+        self.health_state["status"] = "running"
+        status, body = self._get("/metrics")
+        assert status == 200
+        assert "agent_engine_messages_processed_total" in body
+        assert "agent_engine_alerts_generated_total" in body
+        assert "agent_engine_errors_total" in body
+        assert "agent_engine_kafka_connected" in body
+
+    def test_unknown_path_returns_404(self) -> None:
+        code = self._get_status("/unknown")
+        assert code == 404

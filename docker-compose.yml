@@ -13,6 +13,7 @@ volumes:
   kafka-data:
   zookeeper-data:
   zookeeper-log:
+  prometheus-data:
 
 services:
 
@@ -176,4 +177,35 @@ services:
       resources:
         limits:
           cpus: '0.5'
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # Prometheus – metrics scraping for all services
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    hostname: prometheus
+    networks:
+      - compliance-net
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
           memory: 256M

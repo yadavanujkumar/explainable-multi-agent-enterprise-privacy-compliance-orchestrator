@@ -68,6 +68,27 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/metrics":
+            lines = [
+                "# HELP agent_engine_messages_processed_total Total Kafka messages processed",
+                "# TYPE agent_engine_messages_processed_total counter",
+                f"agent_engine_messages_processed_total {_health_state['messages_processed']}",
+                "# HELP agent_engine_alerts_generated_total Total compliance alerts generated",
+                "# TYPE agent_engine_alerts_generated_total counter",
+                f"agent_engine_alerts_generated_total {_health_state['alerts_generated']}",
+                "# HELP agent_engine_errors_total Total processing errors",
+                "# TYPE agent_engine_errors_total counter",
+                f"agent_engine_errors_total {_health_state['errors']}",
+                "# HELP agent_engine_kafka_connected Whether the engine is connected to Kafka (1=yes, 0=no)",
+                "# TYPE agent_engine_kafka_connected gauge",
+                f"agent_engine_kafka_connected {1 if _health_state['kafka_connected'] else 0}",
+                "",
+            ]
+            body = "\n".join(lines).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()

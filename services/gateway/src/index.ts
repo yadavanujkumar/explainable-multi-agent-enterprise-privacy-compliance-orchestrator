@@ -10,6 +10,7 @@
  *  - Zod request validation
  *  - Graceful shutdown (SIGTERM / SIGINT)
  *  - Kafka consumer / producer with retry and acks=all
+ *  - Circuit-breaker for Kafka producer calls
  */
 import crypto from 'crypto';
 import express, { NextFunction, Request, Response } from 'express';
@@ -19,6 +20,7 @@ import { z } from 'zod';
 
 import { SlackIntegration } from './application/SlackIntegration';
 import { TeamsIntegration } from './application/TeamsIntegration';
+import { CircuitBreaker, CircuitOpenError } from './infrastructure/circuitBreaker';
 import { logger } from './infrastructure/logger';
 import { auditLogger } from './middleware/auditLogger';
 import { verifySlackSignature } from './middleware/slackVerification';
@@ -96,14 +98,24 @@ const webhookLimiter = rateLimit({
 });
 
 // ---------------------------------------------------------------------------
-// Health / readiness probes
+// Health / readiness probes + Prometheus metrics
 // ---------------------------------------------------------------------------
 let kafkaReady = false;
+
+// Simple in-process metrics counters (Prometheus text format)
+const metrics = {
+  http_requests_total: 0,
+  webhook_slack_total: 0,
+  webhook_teams_total: 0,
+  kafka_messages_sent_total: 0,
+  kafka_circuit_open_total: 0,
+};
 
 app.get('/health', (_req, res) => {
   res.status(200).json({
     status: 'ok',
     kafka_ready: kafkaReady,
+    kafka_circuit: producerCircuit.currentState,
     uptime_seconds: Math.floor(process.uptime()),
   });
 });
@@ -113,6 +125,33 @@ app.get('/readyz', (_req, res) => {
     return res.status(503).json({ status: 'not_ready', reason: 'kafka_not_connected' });
   }
   res.status(200).json({ status: 'ready' });
+});
+
+/** Prometheus-compatible text exposition endpoint */
+app.get('/metrics', (_req, res) => {
+  const lines = [
+    '# HELP http_requests_total Total HTTP requests handled by this gateway',
+    '# TYPE http_requests_total counter',
+    `http_requests_total ${metrics.http_requests_total}`,
+    '# HELP webhook_slack_total Total Slack webhook events received',
+    '# TYPE webhook_slack_total counter',
+    `webhook_slack_total ${metrics.webhook_slack_total}`,
+    '# HELP webhook_teams_total Total Microsoft Teams webhook events received',
+    '# TYPE webhook_teams_total counter',
+    `webhook_teams_total ${metrics.webhook_teams_total}`,
+    '# HELP kafka_messages_sent_total Total Kafka messages successfully sent by the producer',
+    '# TYPE kafka_messages_sent_total counter',
+    `kafka_messages_sent_total ${metrics.kafka_messages_sent_total}`,
+    '# HELP kafka_circuit_open_total Total times the Kafka producer circuit was tripped open',
+    '# TYPE kafka_circuit_open_total counter',
+    `kafka_circuit_open_total ${metrics.kafka_circuit_open_total}`,
+    '# HELP process_uptime_seconds Gateway process uptime in seconds',
+    '# TYPE process_uptime_seconds gauge',
+    `process_uptime_seconds ${Math.floor(process.uptime())}`,
+    '',
+  ];
+  res.set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+  res.send(lines.join('\n'));
 });
 
 // ---------------------------------------------------------------------------
@@ -127,6 +166,15 @@ const kafka = new Kafka({
 
 const consumer = kafka.consumer({ groupId: 'gateway-group' });
 const producer = kafka.producer({ allowAutoTopicCreation: true });
+
+// ---------------------------------------------------------------------------
+// Circuit breaker – wraps all producer.send() calls
+// ---------------------------------------------------------------------------
+const producerCircuit = new CircuitBreaker({
+  name: 'kafka-producer',
+  failureThreshold: 5,
+  resetTimeoutMs: 30_000,
+});
 
 // ---------------------------------------------------------------------------
 // Integrations
@@ -149,6 +197,8 @@ app.post(
   webhookLimiter,
   verifySlackSignature,
   async (req: Request, res: Response) => {
+    metrics.http_requests_total++;
+    metrics.webhook_slack_total++;
     try {
       const parsed = SlackInteractionSchema.safeParse(req.body);
       if (!parsed.success) {
@@ -162,43 +212,54 @@ app.post(
       const actor = payload.user?.name ?? 'unknown';
 
       if (action.value === 'approve_remediation') {
-        await producer.send({
-          topic: REMEDIATION_TOPIC,
-          messages: [
-            {
-              value: JSON.stringify({
-                alertId,
-                status: 'APPROVED',
-                actor,
-                timestamp: new Date().toISOString(),
-              }),
-            },
-          ],
-        });
+        await producerCircuit.execute(() =>
+          producer.send({
+            topic: REMEDIATION_TOPIC,
+            messages: [
+              {
+                value: JSON.stringify({
+                  alertId,
+                  status: 'APPROVED',
+                  actor,
+                  timestamp: new Date().toISOString(),
+                }),
+              },
+            ],
+          })
+        );
+        metrics.kafka_messages_sent_total++;
         logger.info('Remediation approved via Slack', { alertId, actor });
         return res.status(200).json({ message: 'Remediation approved and queued.' });
       }
 
       if (action.value === 'reject') {
-        await producer.send({
-          topic: REMEDIATION_TOPIC,
-          messages: [
-            {
-              value: JSON.stringify({
-                alertId,
-                status: 'REJECTED',
-                actor,
-                timestamp: new Date().toISOString(),
-              }),
-            },
-          ],
-        });
+        await producerCircuit.execute(() =>
+          producer.send({
+            topic: REMEDIATION_TOPIC,
+            messages: [
+              {
+                value: JSON.stringify({
+                  alertId,
+                  status: 'REJECTED',
+                  actor,
+                  timestamp: new Date().toISOString(),
+                }),
+              },
+            ],
+          })
+        );
+        metrics.kafka_messages_sent_total++;
         logger.info('Remediation rejected via Slack', { alertId, actor });
         return res.status(200).json({ message: 'Remediation rejected.' });
       }
 
       res.status(200).json({ message: 'Action acknowledged.' });
     } catch (error) {
+      if (error instanceof CircuitOpenError) {
+        metrics.kafka_circuit_open_total++;
+        logger.warn('Kafka producer circuit open – Slack action queued for retry', { error: error.message });
+        return res.status(503).json({ error: 'Service temporarily unavailable. Please retry shortly.' });
+      }
       logger.error('Slack webhook processing error', { error });
       res.status(500).json({ error: 'Internal server error' });
     }
@@ -211,6 +272,8 @@ app.post(
  * Receives Microsoft Teams Adaptive Card submit actions (approve / reject).
  */
 app.post('/webhook/teams', webhookLimiter, async (req: Request, res: Response) => {
+  metrics.http_requests_total++;
+  metrics.webhook_teams_total++;
   try {
     const parsed = TeamsActionSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -221,23 +284,31 @@ app.post('/webhook/teams', webhookLimiter, async (req: Request, res: Response) =
     const { alertId, action } = parsed.data;
     const status = action === 'approve_remediation' ? 'APPROVED' : 'REJECTED';
 
-    await producer.send({
-      topic: REMEDIATION_TOPIC,
-      messages: [
-        {
-          value: JSON.stringify({
-            alertId,
-            status,
-            actor: 'teams-user',
-            timestamp: new Date().toISOString(),
-          }),
-        },
-      ],
-    });
+    await producerCircuit.execute(() =>
+      producer.send({
+        topic: REMEDIATION_TOPIC,
+        messages: [
+          {
+            value: JSON.stringify({
+              alertId,
+              status,
+              actor: 'teams-user',
+              timestamp: new Date().toISOString(),
+            }),
+          },
+        ],
+      })
+    );
 
+    metrics.kafka_messages_sent_total++;
     logger.info(`Remediation ${status} via Teams`, { alertId });
     res.status(200).json({ message: `Remediation ${status.toLowerCase()}.` });
   } catch (error) {
+    if (error instanceof CircuitOpenError) {
+      metrics.kafka_circuit_open_total++;
+      logger.warn('Kafka producer circuit open – Teams action queued for retry', { error: error.message });
+      return res.status(503).json({ error: 'Service temporarily unavailable. Please retry shortly.' });
+    }
     logger.error('Teams webhook processing error', { error });
     res.status(500).json({ error: 'Internal server error' });
   }
