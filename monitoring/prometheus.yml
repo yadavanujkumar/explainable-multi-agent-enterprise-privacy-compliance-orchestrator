@@ -1,0 +1,50 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: production
+    service: privacy-compliance-orchestrator
+
+# Alert manager (optional – configure if Alertmanager is deployed)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']
+
+scrape_configs:
+  # ---------------------------------------------------------------------------
+  # Prometheus self-monitoring
+  # ---------------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ---------------------------------------------------------------------------
+  # API Gateway – /metrics endpoint (prometheus-client middleware)
+  # ---------------------------------------------------------------------------
+  - job_name: gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['gateway:3000']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  # ---------------------------------------------------------------------------
+  # Agent Engine – /metrics endpoint exposed on health port
+  # ---------------------------------------------------------------------------
+  - job_name: agent_engine
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['agent-engine:8080']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  # ---------------------------------------------------------------------------
+  # Kafka JMX metrics (via Confluent JMX Exporter if enabled)
+  # Uncomment and adjust port when the JMX exporter sidecar is added.
+  # ---------------------------------------------------------------------------
+  # - job_name: kafka
+  #   static_configs:
+  #     - targets: ['kafka:7071']
