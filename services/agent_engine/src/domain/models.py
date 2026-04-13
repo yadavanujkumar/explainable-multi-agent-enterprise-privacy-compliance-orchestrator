@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import datetime
 from enum import Enum
 from typing import Dict, List, Optional
-from pydantic import BaseModel, Field
-import datetime
+
+from pydantic import BaseModel, Field, field_validator
 
 
 class RiskSeverity(str, Enum):
@@ -52,6 +53,20 @@ class PIIFinding(BaseModel):
     detection_method: str = "REGEX"
     confidence: float = 1.0
 
+    @field_validator("risk_score")
+    @classmethod
+    def validate_risk_score(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"risk_score must be between 0.0 and 1.0, got {v}")
+        return v
+
+    @field_validator("confidence")
+    @classmethod
+    def validate_confidence(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"confidence must be between 0.0 and 1.0, got {v}")
+        return v
+
 
 class RedactionPolicy(BaseModel):
     policy_id: str
@@ -60,6 +75,13 @@ class RedactionPolicy(BaseModel):
     redaction_method: str = "MASK"
     simulation_passed: bool = False
     downstream_impact_score: float = 0.0
+
+    @field_validator("downstream_impact_score")
+    @classmethod
+    def validate_impact_score(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"downstream_impact_score must be between 0.0 and 1.0, got {v}")
+        return v
 
 
 class AuditEntry(BaseModel):
@@ -84,6 +106,8 @@ class ComplianceAlert(BaseModel):
     status: AlertStatus = AlertStatus.PENDING_APPROVAL
     severity: RiskSeverity = RiskSeverity.MEDIUM
     triggered_frameworks: List[ComplianceFramework] = Field(default_factory=list)
+    breach_notification_required: bool = False
+    remediation_guidance: Dict[str, str] = Field(default_factory=dict)
     created_at: str = Field(
         default_factory=lambda: datetime.datetime.utcnow().isoformat() + "Z"
     )

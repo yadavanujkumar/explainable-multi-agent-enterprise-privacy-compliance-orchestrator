@@ -63,7 +63,10 @@ _RULES: List[ComplianceRule] = [
         framework=ComplianceFramework.GDPR,
         description="Personal data must be protected with appropriate technical measures.",
         article="Art. 32",
-        triggered_by=["EMAIL", "PHONE_NUMBER", "DATE_OF_BIRTH", "IP_ADDRESS"],
+        triggered_by=[
+            "EMAIL", "PHONE_NUMBER", "DATE_OF_BIRTH", "IP_ADDRESS",
+            "PASSPORT_NUMBER", "DRIVERS_LICENSE",
+        ],
     ),
     ComplianceRule(
         rule_id="GDPR-002",
@@ -83,7 +86,9 @@ _RULES: List[ComplianceRule] = [
         framework=ComplianceFramework.CCPA,
         description="Consumers have the right to know what personal information is collected.",
         article="§1798.100",
-        triggered_by=["EMAIL", "PHONE_NUMBER", "SSN", "DRIVERS_LICENSE"],
+        triggered_by=[
+            "EMAIL", "PHONE_NUMBER", "SSN", "DRIVERS_LICENSE", "PASSPORT_NUMBER",
+        ],
     ),
     ComplianceRule(
         rule_id="CCPA-002",
@@ -113,6 +118,26 @@ _RULES: List[ComplianceRule] = [
         article="Req. 4.1",
         triggered_by=["CREDIT_CARD"],
     ),
+    ComplianceRule(
+        rule_id="SOX-001",
+        framework=ComplianceFramework.SOX,
+        description=(
+            "Financial records containing personally identifiable information must be "
+            "access-controlled and audit-logged to ensure integrity and traceability."
+        ),
+        article="Section 302",
+        triggered_by=["SSN", "CREDIT_CARD", "IBAN"],
+    ),
+    ComplianceRule(
+        rule_id="SOX-002",
+        framework=ComplianceFramework.SOX,
+        description=(
+            "Internal controls over financial reporting must protect employee and "
+            "customer PII from unauthorised disclosure."
+        ),
+        article="Section 404",
+        triggered_by=["EMAIL", "PHONE_NUMBER", "SSN"],
+    ),
 ]
 
 
@@ -121,7 +146,7 @@ class ComplianceEngine:
     Enterprise compliance rules engine.
 
     Evaluates a set of PIIFindings against a catalogue of regulatory rules
-    (GDPR, CCPA, HIPAA, PCI-DSS) and returns triggered violations with
+    (GDPR, CCPA, HIPAA, PCI-DSS, SOX) and returns triggered violations with
     remediation guidance.
     """
 

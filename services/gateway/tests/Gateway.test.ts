@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import { Request, Response } from 'express';
 import { SlackIntegration } from '../src/application/SlackIntegration';
 import { TeamsIntegration } from '../src/application/TeamsIntegration';
+import type { ComplianceAlert } from '../src/types';
 
 // ---------------------------------------------------------------------------
 // Mock logger so tests don't emit output
@@ -21,7 +22,7 @@ jest.mock('../src/infrastructure/logger', () => ({
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
-const mockAlert = {
+const mockAlert: ComplianceAlert = {
   alert_id: 'abc-123',
   event_id: 'event-999',
   source_system: 'CRM',
@@ -29,6 +30,7 @@ const mockAlert = {
   proposed_redaction_policy: 'REDACT_ENTITIES:SSN,EMAIL',
   severity: 'CRITICAL',
   triggered_frameworks: ['GDPR', 'CCPA', 'HIPAA'],
+  breach_notification_required: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -318,5 +320,42 @@ describe('CircuitBreaker', () => {
 
     await expect(cb.execute(() => Promise.reject(new Error('probe fail')))).rejects.toThrow();
     expect(cb.currentState).toBe('OPEN');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shared types tests
+// ---------------------------------------------------------------------------
+describe('ComplianceAlert shared types', () => {
+  it('should accept a complete alert object conforming to the shared type', () => {
+    const alert: ComplianceAlert = {
+      alert_id: 'test-alert-001',
+      event_id: 'event-001',
+      source_system: 'HR_SYSTEM',
+      xai_explanation: 'CRITICAL PII detected',
+      proposed_redaction_policy: 'REDACT_ENTITIES:SSN',
+      severity: 'CRITICAL',
+      triggered_frameworks: ['GDPR', 'CCPA', 'HIPAA', 'PCI_DSS', 'SOX'],
+      breach_notification_required: true,
+      remediation_guidance: {
+        'GDPR-001': '[GDPR Art. 32] Apply redaction — notify DPO.',
+        'SOX-001': '[SOX Section 302] Apply access controls.',
+      },
+    };
+    expect(alert.breach_notification_required).toBe(true);
+    expect(alert.triggered_frameworks).toContain('SOX');
+    expect(alert.remediation_guidance?.['SOX-001']).toBeTruthy();
+  });
+
+  it('should allow optional fields to be undefined', () => {
+    const minimalAlert: ComplianceAlert = {
+      alert_id: 'minimal-001',
+      event_id: 'event-002',
+      xai_explanation: 'No PII found',
+      proposed_redaction_policy: 'NO_ACTION_REQUIRED',
+    };
+    expect(minimalAlert.severity).toBeUndefined();
+    expect(minimalAlert.breach_notification_required).toBeUndefined();
+    expect(minimalAlert.triggered_frameworks).toBeUndefined();
   });
 });

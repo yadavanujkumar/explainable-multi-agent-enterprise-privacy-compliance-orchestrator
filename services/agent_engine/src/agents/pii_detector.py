@@ -229,6 +229,36 @@ class PIIDetectorAgent:
             return f"{'*' * len(local)}@{domain}"
         if entity_type == "PASSPORT_NUMBER":
             return value[:2] + "*" * (len(value) - 2)
+        if entity_type == "PHONE_NUMBER":
+            # Preserve only the last 4 digits
+            digits_only = re.sub(r'\D', '', value)
+            masked = re.sub(r'\d', '*', value)
+            if len(digits_only) >= 4:
+                last4 = digits_only[-4:]
+                masked = masked[:-4] + last4
+            return masked
+        if entity_type == "IP_ADDRESS":
+            # Mask the last two octets: 192.168.x.x → 192.168.*.*
+            parts = value.split(".")
+            if len(parts) == 4:
+                return f"{parts[0]}.{parts[1]}.*.*"
+            return "[REDACTED]"
+        if entity_type == "DATE_OF_BIRTH":
+            # Preserve year, mask month/day: **/**/1990
+            parts = re.split(r'[/\-]', value)
+            if len(parts) == 3:
+                return f"**/**/{parts[2]}"
+            return "[REDACTED]"
+        if entity_type == "MEDICAL_RECORD_NUMBER":
+            # Preserve prefix, mask digits: MRN-******
+            prefix_match = re.match(r'^(MRN[-:\s]?)', value, re.IGNORECASE)
+            prefix = prefix_match.group(1) if prefix_match else ""
+            return prefix + "*" * (len(value) - len(prefix))
+        if entity_type == "DRIVERS_LICENSE":
+            # Preserve prefix, mask rest: DL-*******
+            prefix_match = re.match(r'^(DL[-:\s]?)', value, re.IGNORECASE)
+            prefix = prefix_match.group(1) if prefix_match else ""
+            return prefix + "*" * (len(value) - len(prefix))
         return "[REDACTED]"
 
     @staticmethod

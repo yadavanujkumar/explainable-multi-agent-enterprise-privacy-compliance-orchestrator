@@ -1,16 +1,9 @@
 # Core streaming
-kafka-python==2.0.2
+kafka-python==2.0.6
 
 # Domain models / validation
-pydantic==2.5.2
-
-# AI / LLM orchestration (enterprise integrations)
-langchain==0.1.0
-openai==1.10.0
-
-# Observability
-prometheus-client==0.19.0
+pydantic==2.6.4
 
 # Testing
-pytest==7.4.3
+pytest==7.4.4
 pytest-cov==4.1.0
