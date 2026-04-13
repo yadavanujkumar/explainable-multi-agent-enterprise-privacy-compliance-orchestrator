@@ -9,16 +9,9 @@
 import https from 'https';
 import { URL } from 'url';
 import { logger } from '../infrastructure/logger';
+import { ComplianceAlert } from '../types';
 
-export interface ComplianceAlert {
-  alert_id: string;
-  event_id: string;
-  source_system?: string;
-  xai_explanation: string;
-  proposed_redaction_policy: string;
-  severity?: string;
-  triggered_frameworks?: string[];
-}
+export type { ComplianceAlert };
 
 const SEVERITY_COLOURS: Record<string, string> = {
   CRITICAL: 'attention',

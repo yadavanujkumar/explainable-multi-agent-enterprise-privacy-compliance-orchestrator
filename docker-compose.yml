@@ -1,4 +1,3 @@
-version: '3.8'
 
 # ---------------------------------------------------------------------------
 # Enterprise Privacy Compliance Orchestrator
@@ -117,6 +116,8 @@ services:
       FL_CLIENT_ID: ${FL_CLIENT_ID:-agent-engine-01}
       FL_SERVER_URL: ${FL_SERVER_URL:-https://fl-server.internal/api/v1}
       FL_DP_NOISE_SCALE: ${FL_DP_NOISE_SCALE:-0.1}
+      FL_GRADIENT_CLIP_NORM: ${FL_GRADIENT_CLIP_NORM:-1.0}
+      FL_ROUNDS: ${FL_ROUNDS:-10}
     ports:
       - "8080:8080"
     restart: unless-stopped

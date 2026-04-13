@@ -24,6 +24,7 @@ import { CircuitBreaker, CircuitOpenError } from './infrastructure/circuitBreake
 import { logger } from './infrastructure/logger';
 import { auditLogger } from './middleware/auditLogger';
 import { verifySlackSignature } from './middleware/slackVerification';
+import type { ComplianceAlert } from './types';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -78,6 +79,15 @@ app.use(
 app.use(express.json());
 app.use(auditLogger);
 
+// Security headers
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'");
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
+
 // Global rate limiter: 120 req / min per IP
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -112,6 +122,7 @@ const metrics = {
 };
 
 app.get('/health', (_req, res) => {
+  metrics.http_requests_total++;
   res.status(200).json({
     status: 'ok',
     kafka_ready: kafkaReady,
@@ -121,6 +132,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.get('/readyz', (_req, res) => {
+  metrics.http_requests_total++;
   if (!kafkaReady) {
     return res.status(503).json({ status: 'not_ready', reason: 'kafka_not_connected' });
   }
@@ -329,8 +341,12 @@ async function start(): Promise<void> {
     eachMessage: async ({ message }) => {
       if (!message.value) return;
       try {
-        const alert = JSON.parse(message.value.toString());
-        logger.info('Received compliance alert', { alert_id: alert.alert_id });
+        const alert = JSON.parse(message.value.toString()) as ComplianceAlert;
+        logger.info('Received compliance alert', {
+          alert_id: alert.alert_id,
+          severity: alert.severity,
+          breach_notification_required: alert.breach_notification_required,
+        });
 
         // Fan-out to both Slack and Teams
         await Promise.allSettled([

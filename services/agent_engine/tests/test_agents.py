@@ -3,15 +3,19 @@ Enterprise-grade test suite for the Agent Engine.
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 from src.domain.models import (
     ComplianceFramework,
     DataEvent,
+    PIIFinding,
     RiskSeverity,
 )
 from src.agents.pii_detector import PIIDetectorAgent
 from src.agents.xai_explainer import XAIExplainerAgent
 from src.agents.compliance_engine import ComplianceEngine
+from src.federated.fl_client import DifferentialPrivacyMechanism, FederatedLearningClient
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +141,55 @@ class TestPIIDetectorEnrichment:
 
 
 # ---------------------------------------------------------------------------
+# PII Detector – improved redaction for all entity types
+# ---------------------------------------------------------------------------
+class TestPIIDetectorRedaction:
+    def test_email_redaction_masks_local_part(self, detector: PIIDetectorAgent) -> None:
+        findings = detector.scan_payload(_make_event("user@example.com"))
+        email = next(f for f in findings if f.entity_type == "EMAIL")
+        assert email.redacted_value.endswith("@example.com")
+        assert "*" in email.redacted_value
+
+    def test_phone_redaction_preserves_last_four(self, detector: PIIDetectorAgent) -> None:
+        findings = detector.scan_payload(_make_event("Call 555-867-5309"))
+        phone = next(f for f in findings if f.entity_type == "PHONE_NUMBER")
+        assert "5309" in phone.redacted_value
+
+    def test_ip_redaction_masks_last_two_octets(self, detector: PIIDetectorAgent) -> None:
+        findings = detector.scan_payload(_make_event("IP 192.168.1.100"))
+        ip = next(f for f in findings if f.entity_type == "IP_ADDRESS")
+        assert ip.redacted_value == "192.168.*.*"
+
+    def test_dob_redaction_preserves_year(self, detector: PIIDetectorAgent) -> None:
+        findings = detector.scan_payload(_make_event("DOB: 01/15/1990"))
+        dob = next(f for f in findings if f.entity_type == "DATE_OF_BIRTH")
+        assert "1990" in dob.redacted_value
+        assert dob.redacted_value.startswith("**/**/")
+
+    def test_mrn_redaction_preserves_prefix(self, detector: PIIDetectorAgent) -> None:
+        findings = detector.scan_payload(_make_event("Patient MRN-123456"))
+        mrn = next(f for f in findings if f.entity_type == "MEDICAL_RECORD_NUMBER")
+        assert mrn.redacted_value.upper().startswith("MRN")
+        assert "*" in mrn.redacted_value
+
+    def test_drivers_license_redaction_preserves_prefix(
+        self, detector: PIIDetectorAgent
+    ) -> None:
+        findings = detector.scan_payload(_make_event("DL-ABC1234567"))
+        dl = next(f for f in findings if f.entity_type == "DRIVERS_LICENSE")
+        assert dl.redacted_value.upper().startswith("DL")
+        assert "*" in dl.redacted_value
+
+    def test_passport_redaction_preserves_first_two_chars(
+        self, detector: PIIDetectorAgent
+    ) -> None:
+        findings = detector.scan_payload(_make_event("Passport AB1234567"))
+        passport = next(f for f in findings if f.entity_type == "PASSPORT_NUMBER")
+        assert passport.redacted_value[:2] == "AB"
+        assert "*" in passport.redacted_value
+
+
+# ---------------------------------------------------------------------------
 # PII Detector – redaction policy
 # ---------------------------------------------------------------------------
 class TestPIIDetectorRedactionPolicy:
@@ -161,6 +214,41 @@ class TestPIIDetectorRedactionPolicy:
         frameworks = detector.triggered_frameworks(findings)
         # No duplicates
         assert len(frameworks) == len(set(frameworks))
+
+
+# ---------------------------------------------------------------------------
+# Domain model validators
+# ---------------------------------------------------------------------------
+class TestModelValidators:
+    def test_pii_finding_risk_score_valid(self) -> None:
+        finding = PIIFinding(
+            entity_type="EMAIL",
+            start_idx=0,
+            end_idx=10,
+            risk_score=0.75,
+        )
+        assert finding.risk_score == 0.75
+
+    def test_pii_finding_risk_score_out_of_range_raises(self) -> None:
+        import pydantic
+        with pytest.raises(pydantic.ValidationError):
+            PIIFinding(
+                entity_type="EMAIL",
+                start_idx=0,
+                end_idx=10,
+                risk_score=1.5,
+            )
+
+    def test_pii_finding_confidence_out_of_range_raises(self) -> None:
+        import pydantic
+        with pytest.raises(pydantic.ValidationError):
+            PIIFinding(
+                entity_type="EMAIL",
+                start_idx=0,
+                end_idx=10,
+                risk_score=0.5,
+                confidence=-0.1,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +324,76 @@ class TestComplianceEngine:
         rules, _, _ = compliance_engine.evaluate(findings)
         rule_ids = [r.rule_id for r in rules]
         assert "HIPAA-001" in rule_ids
+
+    def test_ssn_triggers_sox_rule(
+        self, compliance_engine: ComplianceEngine, detector: PIIDetectorAgent
+    ) -> None:
+        findings = detector.scan_payload(_make_event("SSN 123-45-6789"))
+        rules, _, _ = compliance_engine.evaluate(findings)
+        rule_ids = [r.rule_id for r in rules]
+        assert "SOX-001" in rule_ids or "SOX-002" in rule_ids
+
+    def test_passport_triggers_gdpr_rule(
+        self, compliance_engine: ComplianceEngine, detector: PIIDetectorAgent
+    ) -> None:
+        findings = detector.scan_payload(_make_event("Passport AB1234567"))
+        rules, _, _ = compliance_engine.evaluate(findings)
+        rule_ids = [r.rule_id for r in rules]
+        assert "GDPR-001" in rule_ids
+
+    def test_passport_triggers_ccpa_rule(
+        self, compliance_engine: ComplianceEngine, detector: PIIDetectorAgent
+    ) -> None:
+        findings = detector.scan_payload(_make_event("Passport AB1234567"))
+        rules, _, _ = compliance_engine.evaluate(findings)
+        rule_ids = [r.rule_id for r in rules]
+        assert "CCPA-001" in rule_ids
+
+
+# ---------------------------------------------------------------------------
+# Federated Learning Client – Differential Privacy
+# ---------------------------------------------------------------------------
+class TestDifferentialPrivacyMechanism:
+    def test_noise_is_applied(self) -> None:
+        dp = DifferentialPrivacyMechanism(noise_scale=1.0, clip_norm=1.0)
+        gradient = [1.0] * 128
+        noised = dp.clip_and_noise(gradient)
+        # With noise_scale=1.0 the noised gradient should differ from the original
+        assert noised != gradient
+
+    def test_clipping_reduces_large_gradients(self) -> None:
+        dp = DifferentialPrivacyMechanism(noise_scale=0.0, clip_norm=1.0)
+        # Very large gradient; L2 norm >> clip_norm
+        gradient = [100.0] * 128
+        clipped = dp.clip_and_noise(gradient)
+        l2 = math.sqrt(sum(g * g for g in clipped))
+        assert l2 <= dp.clip_norm + 1e-6
+
+    def test_small_gradient_not_upscaled(self) -> None:
+        dp = DifferentialPrivacyMechanism(noise_scale=0.0, clip_norm=10.0)
+        gradient = [0.1] * 4
+        clipped = dp.clip_and_noise(gradient)
+        # L2 norm of [0.1, 0.1, 0.1, 0.1] = 0.2, well below clip_norm=10
+        # Gradient should NOT be upscaled
+        for orig, clp in zip(gradient, clipped):
+            assert abs(clp - orig) < 1e-9
+
+    def test_empty_gradient_returns_empty(self) -> None:
+        dp = DifferentialPrivacyMechanism()
+        assert dp.clip_and_noise([]) == []
+
+    def test_fl_client_gradient_has_dp_config(self) -> None:
+        client = FederatedLearningClient(client_id="test-client")
+        payload = client.compute_local_gradient([{"sample": "data"}])
+        assert "dp_config" in payload
+        assert "noise_scale" in payload["dp_config"]
+        assert "clip_norm" in payload["dp_config"]
+
+    def test_fl_client_health_includes_clip_norm(self) -> None:
+        client = FederatedLearningClient(client_id="test-client")
+        health = client.get_health()
+        assert "dp_clip_norm" in health
+        assert "max_rounds" in health
 
 
 # ---------------------------------------------------------------------------

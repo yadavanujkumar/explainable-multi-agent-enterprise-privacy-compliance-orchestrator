@@ -1,11 +1,21 @@
+FROM python:3.10-slim AS builder
+
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ---------------------------------------------------------------------------
+# Production image – only compiled artefacts and installed packages
+# ---------------------------------------------------------------------------
 FROM python:3.10-slim
 
 # Security: run as non-root
 RUN groupadd -r appgroup && useradd -r -g appgroup appuser
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy only installed packages from builder
+COPY --from=builder /install /usr/local
 
 COPY src/ ./src/
 

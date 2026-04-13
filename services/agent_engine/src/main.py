@@ -187,7 +187,10 @@ def process_event(
     policy_detail = detector.generate_redaction_policy_detail(findings)
     frameworks = detector.triggered_frameworks(findings)
 
-    # 5. Build compliance alert
+    # 5. Remediation guidance
+    remediation_guidance = compliance_engine.get_remediation_guidance(triggered_rules)
+
+    # 6. Build compliance alert
     audit_entry = AuditEntry(
         audit_id=str(uuid.uuid4()),
         event_id=event.event_id,
@@ -211,11 +214,13 @@ def process_event(
         status=AlertStatus.PENDING_APPROVAL,
         severity=overall_severity,
         triggered_frameworks=frameworks,
+        breach_notification_required=breach_required,
+        remediation_guidance=remediation_guidance,
         tenant_id=event.tenant_id,
         audit_trail=[audit_entry],
     )
 
-    # 6. Publish alert to Kafka (with acks=all for durability)
+    # 7. Publish alert to Kafka (with acks=all for durability)
     try:
         future = producer.send(ALERT_TOPIC, alert.model_dump())
         future.get(timeout=10)
@@ -232,7 +237,7 @@ def process_event(
         _health_state["errors"] += 1
         raise
 
-    # 7. Publish audit entry
+    # 8. Publish audit entry
     try:
         producer.send(AUDIT_TOPIC, audit_entry.model_dump())
     except KafkaError as e:
