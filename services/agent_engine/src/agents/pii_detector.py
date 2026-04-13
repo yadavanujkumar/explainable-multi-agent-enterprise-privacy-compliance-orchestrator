@@ -230,13 +230,15 @@ class PIIDetectorAgent:
         if entity_type == "PASSPORT_NUMBER":
             return value[:2] + "*" * (len(value) - 2)
         if entity_type == "PHONE_NUMBER":
-            # Preserve only the last 4 digits
+            # Preserve only the last 4 digits; mask all other digits in place
             digits_only = re.sub(r'\D', '', value)
-            masked = re.sub(r'\d', '*', value)
-            if len(digits_only) >= 4:
-                last4 = digits_only[-4:]
-                masked = masked[:-4] + last4
-            return masked
+            last4 = digits_only[-4:] if len(digits_only) >= 4 else digits_only
+            # Replace all digits with '*', then restore the last 4
+            masked_chars = list(re.sub(r'\d', '*', value))
+            digit_positions = [i for i, ch in enumerate(value) if ch.isdigit()]
+            for pos, digit in zip(digit_positions[-4:], last4):
+                masked_chars[pos] = digit
+            return "".join(masked_chars)
         if entity_type == "IP_ADDRESS":
             # Mask the last two octets: 192.168.x.x → 192.168.*.*
             parts = value.split(".")
